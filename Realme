@@ -1,0 +1,17 @@
+# Lifeline (prototype)
+
+Medical-records prototype on Supabase Auth + Postgres. Use fictional data only. Not security-reviewed.
+
+## Run locally
+    npm install
+    npm run dev
+
+## Set up Supabase (once)
+1. SQL Editor: paste `sql/lifeline_supabase_ALL.sql` into an empty tab and Run.
+2. Authentication -> Providers -> Email: on. Turn "Confirm email" off while testing.
+3. Authentication -> URL Configuration: set Site URL to your hosted address and add `<address>/login` as a Redirect URL.
+
+## Deploy (Netlify or Vercel, from GitHub)
+Build command `npm run build`, output folder `dist`.
+Environment variables (optional, defaults are built in): `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`.
+Never add a service_role or secret key anywhere in this project.
