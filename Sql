@@ -1,0 +1,261 @@
+-- LIFELINE: full database setup, run ONCE in an empty SQL Editor tab.
+-- Prototype only; needs a security review before real patient data.
+
+-- ===== lifeline_supabase.sql =====
+-- Lifeline prototype schema. Run in Supabase -> SQL Editor.
+-- Needs a security review before any real patient data is stored.
+
+create type user_role as enum ('patient','doctor');
+create type life_stage as enum ('pediatric','adult','geriatric');
+
+create table profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  role user_role not null,
+  full_name text not null,
+  date_of_birth date,
+  sex text check (sex in ('Female','Male','Other')),
+  patient_code text unique default ('LL-' || lpad((floor(random()*10000))::int::text,4,'0') || '-' || lpad((floor(random()*10000))::int::text,4,'0')),
+  qualifications text, registration_no text, hospital text,
+  joined_at timestamptz not null default now()
+);
+
+-- Age is calculated, never stored.
+create view patient_profiles with (security_invoker = true) as
+  select id, full_name, sex, patient_code, joined_at, date_of_birth,
+         date_part('year', age(date_of_birth))::int as age
+  from profiles where role = 'patient';
+
+create table allergies (
+  id uuid primary key default gen_random_uuid(),
+  patient_id uuid not null references profiles(id) on delete cascade,
+  description text not null,
+  verified_by uuid references profiles(id),
+  verified_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+-- One table for pediatric, adult and geriatric history.
+create table medical_records (
+  id uuid primary key default gen_random_uuid(),
+  patient_id uuid not null references profiles(id) on delete cascade,
+  stage life_stage not null,
+  obg_gynae boolean not null default false,
+  record_type text not null,
+  title text not null,
+  note text not null,
+  addendum_to uuid references medical_records(id),
+  author_id uuid not null default auth.uid() references profiles(id),
+  created_at timestamptz not null default now()
+);
+
+create table access_grants (
+  id uuid primary key default gen_random_uuid(),
+  patient_id uuid not null references profiles(id) on delete cascade,
+  doctor_id uuid not null default auth.uid() references profiles(id),
+  minutes int not null check (minutes in (7,60,720,1440)),
+  status text not null default 'pending' check (status in ('pending','approved','denied','revoked')),
+  requested_at timestamptz not null default now(),
+  expires_at timestamptz
+);
+
+-- Is the signed-in doctor allowed to see this patient right now?
+create function has_access(p uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from access_grants
+    where patient_id = p and doctor_id = auth.uid()
+      and status = 'approved' and expires_at > now());
+$$;
+
+-- Doctors find a patient by ID and see only name + ID until approved.
+create function find_patient(code text) returns table (id uuid, full_name text, patient_code text)
+language sql stable security definer set search_path = public as $$
+  select id, full_name, patient_code from profiles
+  where role = 'patient' and patient_code = upper(trim(code))
+    and exists (select 1 from profiles d where d.id = auth.uid() and d.role = 'doctor');
+$$;
+
+-- Patient approves, denies or ends access. The server sets the expiry.
+create function respond_access(grant_id uuid, decision text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if decision = 'approved' then
+    update access_grants set status = 'approved', expires_at = now() + (minutes || ' minutes')::interval
+      where id = grant_id and patient_id = auth.uid() and status = 'pending';
+  elsif decision in ('denied','revoked') then
+    update access_grants set status = decision, expires_at = case when decision = 'revoked' then now() else expires_at end
+      where id = grant_id and patient_id = auth.uid();
+  end if;
+end $$;
+
+create function verify_allergy(allergy_id uuid) returns void
+language sql security definer set search_path = public as $$
+  update allergies set verified_by = auth.uid(), verified_at = now()
+  where id = allergy_id and has_access(patient_id);
+$$;
+
+-- Row Level Security
+alter table profiles enable row level security;
+alter table allergies enable row level security;
+alter table medical_records enable row level security;
+alter table access_grants enable row level security;
+
+create policy "own profile" on profiles for select using (id = auth.uid());
+create policy "doctor sees approved patient" on profiles for select using (has_access(id));
+create policy "create own profile" on profiles for insert with check (id = auth.uid());
+create policy "update own profile" on profiles for update using (id = auth.uid());
+revoke update on profiles from authenticated;
+grant update (full_name, date_of_birth, sex, qualifications, hospital) on profiles to authenticated;
+
+create policy "own allergies" on allergies for select using (patient_id = auth.uid() or has_access(patient_id));
+create policy "patient adds allergy" on allergies for insert with check (patient_id = auth.uid() and verified_by is null);
+
+-- Insert-only: no update or delete policies exist, and privileges are removed.
+create policy "read records" on medical_records for select using (patient_id = auth.uid() or has_access(patient_id));
+create policy "doctor adds record" on medical_records for insert
+  with check (author_id = auth.uid() and has_access(patient_id));
+revoke update, delete on medical_records from authenticated;
+
+create policy "see own grants" on access_grants for select using (patient_id = auth.uid() or doctor_id = auth.uid());
+create policy "doctor requests access" on access_grants for insert
+  with check (doctor_id = auth.uid() and status = 'pending' and expires_at is null);
+revoke update, delete on access_grants from authenticated;
+
+-- ===== lifeline_supabase_patch.sql =====
+-- Run AFTER lifeline_supabase.sql. Prototype only; needs a security review.
+
+-- 1. Stamp each record with its author's details when it is created (a permanent snapshot).
+alter table medical_records
+  add column author_name text, add column author_reg text, add column author_hospital text;
+
+create function stamp_author() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  select full_name, registration_no, hospital
+    into new.author_name, new.author_reg, new.author_hospital
+    from profiles where id = new.author_id;
+  return new;
+end $$;
+
+create trigger medical_records_stamp before insert on medical_records
+  for each row execute function stamp_author();
+
+-- 2. Record who confirmed an allergy.
+alter table allergies add column verified_by_name text;
+
+create or replace function verify_allergy(allergy_id uuid) returns void
+language sql security definer set search_path = public as $$
+  update allergies
+     set verified_by = auth.uid(), verified_at = now(),
+         verified_by_name = (select full_name from profiles where id = auth.uid())
+   where id = allergy_id and has_access(patient_id);
+$$;
+
+-- 3. Patients can see the profiles of doctors who have requested access to them.
+create policy "patient sees requesting doctors" on profiles for select
+  using (role = 'doctor' and exists (
+    select 1 from access_grants g
+    where g.doctor_id = profiles.id and g.patient_id = auth.uid()));
+
+-- ===== lifeline_supabase_auth.sql =====
+-- Run AFTER lifeline_supabase.sql and lifeline_supabase_patch.sql. Prototype only.
+
+-- 1. Profiles are created automatically when someone signs up,
+--    using the metadata sent by the sign-up form. This works even when
+--    email confirmation is turned on.
+create function handle_new_user() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare m jsonb := coalesce(new.raw_user_meta_data, '{}'::jsonb);
+        r text := coalesce(m->>'role', 'patient');
+begin
+  if r not in ('patient','doctor') then r := 'patient'; end if;
+  insert into profiles (id, role, full_name, date_of_birth, sex, qualifications, registration_no, hospital)
+  values (new.id, r::user_role, coalesce(nullif(m->>'full_name',''), 'Unnamed'),
+          nullif(m->>'date_of_birth','')::date, nullif(m->>'sex',''),
+          m->>'qualifications', m->>'registration_no', m->>'hospital');
+  if r = 'patient' and coalesce(m->>'allergies','') <> '' then
+    insert into allergies (patient_id, description) values (new.id, m->>'allergies');
+  end if;
+  return new;
+end $$;
+
+create trigger on_auth_user_created after insert on auth.users
+  for each row execute function handle_new_user();
+
+-- The app no longer inserts profiles directly.
+drop policy if exists "create own profile" on profiles;
+
+-- 2. Avatar
+alter table profiles add column avatar_url text;
+grant update (avatar_url) on profiles to authenticated;
+
+-- 3. Avatar storage. This bucket is PUBLIC: anyone with a photo's URL can open it.
+--    Do not use real patient photos in this prototype.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('avatars', 'avatars', true, 2097152, array['image/png','image/jpeg','image/webp'])
+on conflict (id) do nothing;
+
+create policy "avatars readable" on storage.objects for select
+  using (bucket_id = 'avatars');
+create policy "upload own avatar" on storage.objects for insert to authenticated
+  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "replace own avatar" on storage.objects for update to authenticated
+  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ===== lifeline_supabase_fixes.sql =====
+-- Run LAST, after lifeline_supabase.sql, lifeline_supabase_patch.sql and lifeline_supabase_auth.sql.
+-- Safe to run more than once. Prototype only; needs a security review.
+
+-- 1. Only doctors can request access (before, any signed-in user could).
+create or replace function is_doctor() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from profiles where id = auth.uid() and role = 'doctor');
+$$;
+
+drop policy if exists "doctor requests access" on access_grants;
+create policy "doctor requests access" on access_grants for insert to authenticated
+  with check (doctor_id = auth.uid() and is_doctor() and status = 'pending' and expires_at is null);
+
+-- One open request per doctor and patient, so a patient can't be spammed.
+create unique index if not exists one_pending_request
+  on access_grants (doctor_id, patient_id) where status = 'pending';
+
+-- 2. Only doctors with active access can add records.
+drop policy if exists "doctor adds record" on medical_records;
+create policy "doctor adds record" on medical_records for insert to authenticated
+  with check (author_id = auth.uid() and is_doctor() and has_access(patient_id));
+
+-- 3. Patients can add allergies but can't mark them as confirmed.
+--    (The old check only blocked verified_by, not verified_at or verified_by_name.)
+revoke insert on allergies from authenticated, anon;
+grant insert (patient_id, description) on allergies to authenticated;
+
+-- 4. Signed-out visitors can't call these functions at all.
+revoke execute on function find_patient(text), respond_access(uuid, text), verify_allergy(uuid)
+  from public, anon;
+grant execute on function find_patient(text), respond_access(uuid, text), verify_allergy(uuid)
+  to authenticated;
+
+-- 5. Sign-up shouldn't fail on an unexpected sex value.
+create or replace function handle_new_user() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare m jsonb := coalesce(new.raw_user_meta_data, '{}'::jsonb);
+        r text := coalesce(m->>'role', 'patient');
+begin
+  if r not in ('patient','doctor') then r := 'patient'; end if;
+  insert into profiles (id, role, full_name, date_of_birth, sex, qualifications, registration_no, hospital)
+  values (new.id, r::user_role, coalesce(nullif(m->>'full_name',''), 'Unnamed'),
+          nullif(m->>'date_of_birth','')::date,
+          case when m->>'sex' in ('Female','Male','Other') then m->>'sex' end,
+          m->>'qualifications', m->>'registration_no', m->>'hospital');
+  if r = 'patient' and coalesce(m->>'allergies','') <> '' then
+    insert into allergies (patient_id, description) values (new.id, m->>'allergies');
+  end if;
+  return new;
+end $$;
+
+-- 6. Indexes for the lookups the app makes.
+create index if not exists idx_records_patient on medical_records (patient_id, created_at desc);
+create index if not exists idx_allergies_patient on allergies (patient_id);
+create index if not exists idx_grants_patient on access_grants (patient_id);
+create index if not exists idx_grants_doctor on access_grants (doctor_id, patient_id);
+
